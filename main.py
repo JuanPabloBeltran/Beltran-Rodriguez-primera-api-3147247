@@ -1,254 +1,253 @@
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, validator
-from typing import List, Optional, Dict, Union
-from enum import Enum
-from datetime import datetime
-import asyncio
-import os, sys
+from fastapi import FastAPI, HTTPException, Query, Depends
+from pydantic import BaseModel, Field, EmailStr
+from typing import List, Optional
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, create_engine, or_
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload
 
+# ------------------------------
+# APP
+# ------------------------------
 app = FastAPI(
     title="Mi Biblioteca + API FastAPI",
-    description="API combinada: Biblioteca Personal + Productos + Usuarios",
-    version="1.0.0"
+    description="API combinada: Biblioteca Personal + Productos + Usuarios con BD + Categorías",
+    version="2.0.0"
 )
 
 # ------------------------------
-# MODELOS Pydantic
+# BD SQLite
 # ------------------------------
-class BookStatus(str, Enum):
-    to_read = "to_read"
-    reading = "reading"
-    finished = "finished"
-    paused = "paused"
+DATABASE_URL = "sqlite:///./test.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-class BookGenre(str, Enum):
-    fiction = "fiction"
-    non_fiction = "non_fiction"
-    science = "science"
-    biography = "biography"
-    history = "history"
-    technology = "technology"
-    other = "other"
+# ------------------------------
+# MODELOS
+# ------------------------------
+class UserDB(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), nullable=False)
+    email = Column(String(100), unique=True, index=True, nullable=False)
+    age = Column(Integer, nullable=True)
+    phone = Column(String(15), nullable=True)
 
-class BookBase(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
-    author: str = Field(..., min_length=1, max_length=100)
-    isbn: Optional[str] = Field(None, min_length=10, max_length=17)
-    genre: BookGenre = Field(default=BookGenre.other)
-    pages: Optional[int] = Field(None, ge=1, le=10000)
-    publication_year: Optional[int] = Field(None, ge=1000, le=datetime.now().year)
-    status: BookStatus = Field(default=BookStatus.to_read)
-    rating: Optional[int] = Field(None, ge=1, le=5)
-    notes: Optional[str] = Field(None, max_length=1000)
+class CategoriaDB(Base):
+    __tablename__ = "categorias"
+    id = Column(Integer, primary_key=True, index=True)
+    nombre = Column(String(100), unique=True, index=True)
+    descripcion = Column(String(250))
+    productos = relationship("ProductoDB", back_populates="categoria")
 
-    @validator('isbn')
-    def validate_isbn(cls, v):
-        if v:
-            clean = v.replace('-', '').replace(' ', '')
-            if len(clean) not in [10, 13] or not clean.isdigit():
-                raise ValueError('ISBN debe tener 10 o 13 dígitos y solo números')
-        return v
+class ProductoDB(Base):
+    __tablename__ = "productos"
+    id = Column(Integer, primary_key=True, index=True)
+    nombre = Column(String(100), nullable=False)
+    precio = Column(Float, nullable=False)
+    descripcion = Column(String(250), nullable=False)
+    categoria_id = Column(Integer, ForeignKey("categorias.id"), nullable=True)
+    categoria = relationship("CategoriaDB", back_populates="productos")
 
-class BookCreate(BookBase):
-    pass
+Base.metadata.create_all(bind=engine)
 
-class BookUpdate(BaseModel):
-    title: Optional[str]
-    author: Optional[str]
-    isbn: Optional[str]
-    genre: Optional[BookGenre]
-    pages: Optional[int]
-    publication_year: Optional[int]
-    status: Optional[BookStatus]
-    rating: Optional[int]
-    notes: Optional[str]
+# ------------------------------
+# DEPENDENCIA DB
+# ------------------------------
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-class BookResponse(BookBase):
+# ------------------------------
+# SCHEMAS
+# ------------------------------
+class UserBase(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    email: EmailStr
+    age: Optional[int] = Field(None, ge=0, le=120)
+    phone: Optional[str] = Field(None, pattern=r"^\+?\d{7,15}$")
+
+class UserCreate(UserBase): pass
+class User(UserBase):
     id: int
-    created_at: datetime
-    updated_at: datetime
+    class Config: from_attributes = True
 
-class Product(BaseModel):
-    name: str
-    price: int
-    available: bool = True
+class CategoriaBase(BaseModel):
+    nombre: str
+    descripcion: str
 
-class ProductResponse(BaseModel):
+class CategoriaCreate(CategoriaBase): pass
+class Categoria(CategoriaBase):
     id: int
-    name: str
-    price: int
-    available: bool
-    message: str = "Successful operation"
+    class Config: from_attributes = True
 
-class ProductListResponse(BaseModel):
-    products: List[Dict[str, Union[str, int, bool]]]
-    total: int
-    message: str = "List retrieved"
+class ProductoBase(BaseModel):
+    nombre: str
+    precio: float
+    descripcion: str
+    categoria_id: Optional[int] = None
 
-class CompleteUser(BaseModel):
-    name: str
-    age: int
-    email: str
-    phone: Optional[str] = None
-    active: bool = True
+class ProductoCreate(ProductoBase): pass
+class ProductoUpdate(BaseModel):
+    nombre: Optional[str] = None
+    precio: Optional[float] = None
+    descripcion: Optional[str] = None
+    categoria_id: Optional[int] = None
 
-# ------------------------------
-# BASES DE DATOS EN MEMORIA
-# ------------------------------
-books_db: List[Dict] = []
-products: List[Dict[str, Union[str, int, bool]]] = []
+class ProductoResponse(ProductoBase):
+    id: int
+    categoria: Optional[Categoria] = None
+    class Config: from_attributes = True
 
 # ------------------------------
-# FUNCIONES ASYNC DE APOYO
+# CRUD Categorías
 # ------------------------------
-async def validate_isbn_external(isbn: str) -> bool:
-    await asyncio.sleep(0.5)
-    clean = isbn.replace('-', '').replace(' ', '')
-    return len(clean) in [10, 13]
+def crear_categoria(db: Session, categoria: CategoriaCreate):
+    db_categoria = CategoriaDB(**categoria.dict())
+    db.add(db_categoria)
+    db.commit()
+    db.refresh(db_categoria)
+    return db_categoria
 
-async def backup_book_data(book_data: dict) -> dict:
-    await asyncio.sleep(0.3)
-    return {"backup_id": f"bk_{datetime.now().timestamp()}", "status": "success"}
+def obtener_categoria(db: Session, categoria_id: int):
+    return db.query(CategoriaDB).filter(CategoriaDB.id == categoria_id).first()
 
-async def get_book_metadata(title: str, author: str) -> dict:
-    await asyncio.sleep(0.4)
-    return {"goodreads_rating": 4.2, "amazon_price": 15.99, "availability": "in_stock"}
+def obtener_categorias(db: Session):
+    return db.query(CategoriaDB).all()
+
+def obtener_categoria_con_productos(db: Session, categoria_id: int):
+    return db.query(CategoriaDB).options(joinedload(CategoriaDB.productos)).filter(CategoriaDB.id == categoria_id).first()
 
 # ------------------------------
-# ENDPOINTS BÁSICOS
+# CRUD Productos
 # ------------------------------
-@app.get("/")
-def home() -> Dict[str, str]:
-    return {"message": "Mi Biblioteca + API FastAPI"}
+def crear_producto(db: Session, producto: ProductoCreate):
+    if producto.categoria_id:
+        cat = obtener_categoria(db, producto.categoria_id)
+        if not cat:
+            raise HTTPException(status_code=400, detail="Categoría no existe")
+    db_producto = ProductoDB(**producto.dict())
+    db.add(db_producto)
+    db.commit()
+    db.refresh(db_producto)
+    return db_producto
 
-@app.get("/info/setup")
-def info_setup() -> Dict[str, str]:
+def obtener_producto(db: Session, producto_id: int):
+    return db.query(ProductoDB).options(joinedload(ProductoDB.categoria)).filter(ProductoDB.id == producto_id).first()
+
+def obtener_productos(db: Session, skip: int = 0, limit: int = 10):
+    return db.query(ProductoDB).options(joinedload(ProductoDB.categoria)).offset(skip).limit(limit).all()
+
+def actualizar_producto(db: Session, producto_id: int, producto: ProductoUpdate):
+    db_producto = obtener_producto(db, producto_id)
+    if db_producto:
+        if producto.categoria_id:
+            cat = obtener_categoria(db, producto.categoria_id)
+            if not cat:
+                raise HTTPException(status_code=400, detail="Categoría no existe")
+        for key, value in producto.dict(exclude_unset=True).items():
+            setattr(db_producto, key, value)
+        db.commit()
+        db.refresh(db_producto)
+    return db_producto
+
+def eliminar_producto(db: Session, producto_id: int):
+    db_producto = obtener_producto(db, producto_id)
+    if db_producto:
+        db.delete(db_producto)
+        db.commit()
+    return db_producto
+
+def contar_productos(db: Session):
+    return db.query(ProductoDB).count()
+
+# ------------------------------
+# ENDPOINTS Usuarios
+# ------------------------------
+@app.post("/users", response_model=User)
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = UserDB(**user.dict())
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+@app.get("/users", response_model=List[User])
+def list_users(db: Session = Depends(get_db)):
+    return db.query(UserDB).all()
+
+# ------------------------------
+# ENDPOINTS Categorías
+# ------------------------------
+@app.post("/categorias/", response_model=Categoria)
+def crear_categoria_endpoint(categoria: CategoriaCreate, db: Session = Depends(get_db)):
+    return crear_categoria(db, categoria)
+
+@app.get("/categorias/", response_model=List[Categoria])
+def listar_categorias(db: Session = Depends(get_db)):
+    return obtener_categorias(db)
+
+@app.get("/categorias/{categoria_id}", response_model=Categoria)
+def obtener_categoria_endpoint(categoria_id: int, db: Session = Depends(get_db)):
+    cat = obtener_categoria_con_productos(db, categoria_id)
+    if not cat:
+        raise HTTPException(status_code=404, detail="Categoría no encontrada")
+    return cat
+
+# ------------------------------
+# ENDPOINTS Productos
+# ------------------------------
+@app.post("/productos/", response_model=ProductoResponse)
+def crear_producto_endpoint(producto: ProductoCreate, db: Session = Depends(get_db)):
+    return crear_producto(db, producto)
+
+@app.get("/productos/", response_model=List[ProductoResponse])
+def listar_productos_endpoint(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    return obtener_productos(db, skip=skip, limit=limit)
+
+@app.get("/productos/{producto_id}", response_model=ProductoResponse)
+def obtener_producto_endpoint(producto_id: int, db: Session = Depends(get_db)):
+    prod = obtener_producto(db, producto_id)
+    if not prod:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    return prod
+
+@app.patch("/productos/{producto_id}", response_model=ProductoResponse)
+def actualizar_producto_endpoint(producto_id: int, producto: ProductoUpdate, db: Session = Depends(get_db)):
+    prod = actualizar_producto(db, producto_id, producto)
+    if not prod:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    return prod
+
+@app.delete("/productos/{producto_id}")
+def eliminar_producto_endpoint(producto_id: int, db: Session = Depends(get_db)):
+    prod = eliminar_producto(db, producto_id)
+    if not prod:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    return {"mensaje": f"Producto {producto_id} eliminado correctamente"}
+
+@app.get("/productos/buscar/")
+def buscar_productos_endpoint(q: str = Query(..., min_length=1), db: Session = Depends(get_db)):
+    productos = db.query(ProductoDB).options(joinedload(ProductoDB.categoria)).filter(
+        or_(ProductoDB.nombre.contains(q), ProductoDB.descripcion.contains(q))
+    ).all()
+    return {"busqueda": q, "productos": productos, "total": len(productos)}
+
+@app.get("/productos/stats/")
+def estadisticas_productos_endpoint(db: Session = Depends(get_db)):
+    productos = db.query(ProductoDB).all()
+    if not productos:
+        return {"total": 0, "precio_promedio": 0, "precio_max": 0, "precio_min": 0}
+    precios = [p.precio for p in productos]
     return {
-        "python_version": sys.version,
-        "python_path": sys.executable,
-        "working_directory": os.getcwd(),
-        "virtual_env": os.environ.get("VIRTUAL_ENV", "No detectado"),
-        "user": os.environ.get("USER", os.environ.get("USERNAME", "No detectado")),
-        "hostname": os.environ.get("HOSTNAME", "No detectado")
+        "total": len(productos),
+        "precio_promedio": sum(precios)/len(precios),
+        "precio_max": max(precios),
+        "precio_min": min(precios)
     }
-
-@app.get("/my-profile")
-def my_profile() -> Dict[str, Union[str, bool, int]]:
-    return {
-        "name": "Sebastian Manrique",
-        "bootcamp": "FastAPI",
-        "week": 2,
-        "date": "2025",
-        "likes_fastapi": True
-    }
-
-# ------------------------------
-# CRUD LIBROS
-# ------------------------------
-@app.post("/books", response_model=BookResponse)
-async def create_book(book: BookCreate):
-    if book.isbn:
-        valid = await validate_isbn_external(book.isbn)
-        if not valid:
-            raise HTTPException(status_code=400, detail="ISBN inválido")
-    now = datetime.now()
-    book_dict = book.dict()
-    book_dict.update({"id": len(books_db)+1, "created_at": now, "updated_at": now})
-    books_db.append(book_dict)
-    asyncio.create_task(backup_book_data(book_dict))
-    return book_dict
-
-@app.get("/books", response_model=List[BookResponse])
-def list_books():
-    return books_db
-
-@app.get("/books/{book_id}", response_model=BookResponse)
-def get_book(book_id: int):
-    for b in books_db:
-        if b["id"] == book_id:
-            return b
-    raise HTTPException(status_code=404, detail="Libro no encontrado")
-
-@app.put("/books/{book_id}", response_model=BookResponse)
-def update_book(book_id: int, updated: BookCreate):
-    for idx, b in enumerate(books_db):
-        if b["id"] == book_id:
-            updated_dict = updated.dict()
-            updated_dict.update({"id": book_id, "created_at": b["created_at"], "updated_at": datetime.now()})
-            books_db[idx] = updated_dict
-            return updated_dict
-    raise HTTPException(status_code=404, detail="Libro no encontrado")
-
-@app.patch("/books/{book_id}", response_model=BookResponse)
-def patch_book(book_id: int, updated: BookUpdate):
-    for idx, b in enumerate(books_db):
-        if b["id"] == book_id:
-            for k, v in updated.dict(exclude_unset=True).items():
-                b[k] = v
-            b["updated_at"] = datetime.now()
-            books_db[idx] = b
-            return b
-    raise HTTPException(status_code=404, detail="Libro no encontrado")
-
-@app.delete("/books/{book_id}")
-def delete_book(book_id: int):
-    for idx, b in enumerate(books_db):
-        if b["id"] == book_id:
-            removed = books_db.pop(idx)
-            return {"message": "Libro eliminado", "book": removed}
-    raise HTTPException(status_code=404, detail="Libro no encontrado")
-
-# ------------------------------
-# ENDPOINTS BÚSQUEDA
-# ------------------------------
-@app.get("/books/search/title", response_model=List[BookResponse])
-def search_books_title(title: str = Query(..., min_length=1), limit: int = Query(10, ge=1, le=50)):
-    results = [b for b in books_db if title.lower() in b["title"].lower()]
-    return results[:limit]
-
-@app.get("/books/search/author", response_model=List[BookResponse])
-def search_books_author(author: str = Query(..., min_length=1), limit: int = Query(10, ge=1, le=50)):
-    results = [b for b in books_db if author.lower() in b["author"].lower()]
-    return results[:limit]
-
-# ------------------------------
-# ENDPOINT ASYNC METADATA
-# ------------------------------
-@app.get("/books/{book_id}/metadata")
-async def book_metadata(book_id: int):
-    for b in books_db:
-        if b["id"] == book_id:
-            meta = await get_book_metadata(b["title"], b["author"])
-            return {"book": b, "metadata": meta}
-    raise HTTPException(status_code=404, detail="Libro no encontrado")
-
-# ------------------------------
-# CRUD PRODUCTOS
-# ------------------------------
-@app.post("/products", response_model=ProductResponse)
-def create_product(product: Product) -> ProductResponse:
-    product_dict = product.dict()
-    product_dict["id"] = len(products) + 1
-    products.append(product_dict)
-    return ProductResponse(**product_dict, message="Product created successfully")
-
-@app.get("/products", response_model=ProductListResponse)
-def get_products() -> ProductListResponse:
-    return ProductListResponse(products=products, total=len(products))
-
-@app.get("/products/{product_id}", response_model=ProductResponse)
-def get_product(product_id: int) -> ProductResponse:
-    for product in products:
-        if product["id"] == product_id:
-            return ProductResponse(**product, message="Product found successfully")
-    raise HTTPException(status_code=404, detail="Product not found")
-
-# ------------------------------
-# CRUD USUARIOS
-# ------------------------------
-@app.post("/users")
-def create_user(user: CompleteUser) -> dict:
-    return {"user": user.dict(), "valid": True}
 
 # ------------------------------
 # SERVIDOR
