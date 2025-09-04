@@ -1,11 +1,9 @@
-from pydantic import BaseModel, Field
+from sqlalchemy import Column, Integer, String, Float
+from database import Base
 
-class Product(BaseModel):
-    id: int
-    name: str = Field(..., min_length=2, max_length=50)
-    price: float = Field(..., gt=0)
-    quantity: int = Field(..., ge=0)
-
-class ProductResponse(BaseModel):
-    message: str
-    product: Product
+class Producto(Base):
+    __tablename__ = "productos"
+    id = Column(Integer, primary_key=True, index=True)
+    nombre = Column(String, index=True, nullable=False)
+    precio = Column(Float, nullable=False)
+    descripcion = Column(String, nullable=False)

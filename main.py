@@ -1,17 +1,29 @@
-from fastapi import FastAPI, HTTPException, Query, Depends
+# main.py (VERSIÓN COMPLETA con Roles + Logs + Debug endpoint + Posts + get_current_admin)
+import logging
+from fastapi import FastAPI, HTTPException, Query, Depends, status
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, create_engine, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload
+from fastapi.security import HTTPBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+
+# ------------------------------
+# LOGGING
+# ------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ------------------------------
 # APP
 # ------------------------------
 app = FastAPI(
     title="Mi Biblioteca + API FastAPI",
-    description="API combinada: Biblioteca Personal + Productos + Usuarios con BD + Categorías",
-    version="2.0.0"
+    description="API combinada: Biblioteca Personal + Productos + Usuarios con BD + Categorías + Autenticación + Roles + Posts",
+    version="2.1.1"
 )
 
 # ------------------------------
@@ -48,6 +60,15 @@ class ProductoDB(Base):
     descripcion = Column(String(250), nullable=False)
     categoria_id = Column(Integer, ForeignKey("categorias.id"), nullable=True)
     categoria = relationship("CategoriaDB", back_populates="productos")
+
+# Modelo SQLAlchemy para autenticación (ahora con campo role)
+class AuthUserDB(Base):
+    __tablename__ = "auth_users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, index=True, nullable=False)
+    email = Column(String(100), unique=True, index=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(20), default="user", nullable=False)  # <-- campo role
 
 Base.metadata.create_all(bind=engine)
 
@@ -110,6 +131,7 @@ def crear_categoria(db: Session, categoria: CategoriaCreate):
     db.add(db_categoria)
     db.commit()
     db.refresh(db_categoria)
+    logger.info(f"Categoría creada: {db_categoria.nombre}")
     return db_categoria
 
 def obtener_categoria(db: Session, categoria_id: int):
@@ -133,6 +155,7 @@ def crear_producto(db: Session, producto: ProductoCreate):
     db.add(db_producto)
     db.commit()
     db.refresh(db_producto)
+    logger.info(f"Producto creado: {db_producto.nombre}")
     return db_producto
 
 def obtener_producto(db: Session, producto_id: int):
@@ -152,11 +175,13 @@ def actualizar_producto(db: Session, producto_id: int, producto: ProductoUpdate)
             setattr(db_producto, key, value)
         db.commit()
         db.refresh(db_producto)
+        logger.info(f"Producto actualizado: {db_producto.nombre}")
     return db_producto
 
 def eliminar_producto(db: Session, producto_id: int):
     db_producto = obtener_producto(db, producto_id)
     if db_producto:
+        logger.warning(f"Producto eliminado: {db_producto.nombre}")
         db.delete(db_producto)
         db.commit()
     return db_producto
@@ -165,89 +190,125 @@ def contar_productos(db: Session):
     return db.query(ProductoDB).count()
 
 # ------------------------------
-# ENDPOINTS Usuarios
+# AUTH: Hashing + JWT
 # ------------------------------
-@app.post("/users", response_model=User)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = UserDB(**user.dict())
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+SECRET_KEY = "cambia-esta-clave-en-produccion"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-@app.get("/users", response_model=List[User])
-def list_users(db: Session = Depends(get_db)):
-    return db.query(UserDB).all()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
 
-# ------------------------------
-# ENDPOINTS Categorías
-# ------------------------------
-@app.post("/categorias/", response_model=Categoria)
-def crear_categoria_endpoint(categoria: CategoriaCreate, db: Session = Depends(get_db)):
-    return crear_categoria(db, categoria)
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
-@app.get("/categorias/", response_model=List[Categoria])
-def listar_categorias(db: Session = Depends(get_db)):
-    return obtener_categorias(db)
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
 
-@app.get("/categorias/{categoria_id}", response_model=Categoria)
-def obtener_categoria_endpoint(categoria_id: int, db: Session = Depends(get_db)):
-    cat = obtener_categoria_con_productos(db, categoria_id)
-    if not cat:
-        raise HTTPException(status_code=404, detail="Categoría no encontrada")
-    return cat
+def create_access_token(username: str) -> str:
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode = {"sub": username, "exp": expire}
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def verify_token(token: str) -> Optional[str]:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
 
 # ------------------------------
-# ENDPOINTS Productos
+# DEPENDENCIAS: USUARIO / ADMIN
 # ------------------------------
-@app.post("/productos/", response_model=ProductoResponse)
-def crear_producto_endpoint(producto: ProductoCreate, db: Session = Depends(get_db)):
-    return crear_producto(db, producto)
+def get_current_user(token: str = Depends(security), db: Session = Depends(get_db)):
+    username = verify_token(token.credentials)
+    if not username:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    user = db.query(AuthUserDB).filter(AuthUserDB.username == username).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Usuario no encontrado")
+    return {"id": user.id, "username": user.username, "role": user.role}
 
-@app.get("/productos/", response_model=List[ProductoResponse])
-def listar_productos_endpoint(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
-    return obtener_productos(db, skip=skip, limit=limit)
+def get_current_admin(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    return current_user
 
-@app.get("/productos/{producto_id}", response_model=ProductoResponse)
-def obtener_producto_endpoint(producto_id: int, db: Session = Depends(get_db)):
-    prod = obtener_producto(db, producto_id)
-    if not prod:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
-    return prod
+# ------------------------------
+# DEBUG endpoint (opcional)
+# ------------------------------
+@app.get("/debug/verify-token")
+def verify_token_debug(token: str = Depends(security)):
+    """Solo para debugging - NO usar en producción"""
+    try:
+        payload = jwt.decode(token.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        logger.info(f"Token verificado: {payload}")
+        return {
+            "valid": True,
+            "payload": payload,
+            "username": payload.get("sub"),
+            "expires": payload.get("exp")
+        }
+    except JWTError as e:
+        logger.error(f"Error verificando token: {str(e)}")
+        return {
+            "valid": False,
+            "error": str(e)
+        }
 
-@app.patch("/productos/{producto_id}", response_model=ProductoResponse)
-def actualizar_producto_endpoint(producto_id: int, producto: ProductoUpdate, db: Session = Depends(get_db)):
-    prod = actualizar_producto(db, producto_id, producto)
-    if not prod:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
-    return prod
+# ------------------------------
+# Endpoints Auth
+# ------------------------------
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
-@app.delete("/productos/{producto_id}")
-def eliminar_producto_endpoint(producto_id: int, db: Session = Depends(get_db)):
-    prod = eliminar_producto(db, producto_id)
-    if not prod:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
-    return {"mensaje": f"Producto {producto_id} eliminado correctamente"}
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str
+    username: str
 
-@app.get("/productos/buscar/")
-def buscar_productos_endpoint(q: str = Query(..., min_length=1), db: Session = Depends(get_db)):
-    productos = db.query(ProductoDB).options(joinedload(ProductoDB.categoria)).filter(
-        or_(ProductoDB.nombre.contains(q), ProductoDB.descripcion.contains(q))
-    ).all()
-    return {"busqueda": q, "productos": productos, "total": len(productos)}
+@app.post("/login", response_model=TokenOut)
+def login_user(data: LoginRequest, db: Session = Depends(get_db)):
+    logger.info(f"Intento de login para usuario: {data.username}")
+    user = db.query(AuthUserDB).filter(AuthUserDB.username == data.username).first()
+    if not user or not verify_password(data.password, user.password_hash):
+        logger.warning(f"Login fallido para usuario: {data.username}")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(username=user.username)
+    logger.info(f"Login exitoso para usuario: {data.username}")
+    return {"access_token": token, "token_type": "bearer", "username": user.username}
 
-@app.get("/productos/stats/")
-def estadisticas_productos_endpoint(db: Session = Depends(get_db)):
-    productos = db.query(ProductoDB).all()
-    if not productos:
-        return {"total": 0, "precio_promedio": 0, "precio_max": 0, "precio_min": 0}
-    precios = [p.precio for p in productos]
-    return {
-        "total": len(productos),
-        "precio_promedio": sum(precios)/len(precios),
-        "precio_max": max(precios),
-        "precio_min": min(precios)
+# ------------------------------
+# POSTS (Ejercicio Semana 5)
+# ------------------------------
+class Post(BaseModel):
+    title: str
+    content: str
+
+posts = []  # lista en memoria
+
+@app.post("/posts")
+def create_post(post: Post, current_user: dict = Depends(get_current_user)):
+    new_post = {
+        "id": len(posts) + 1,
+        "title": post.title,
+        "content": post.content,
+        "author": current_user["username"]
     }
+    posts.append(new_post)
+    logger.info(f"Post creado por {current_user['username']}: {post.title}")
+    return new_post
+
+@app.get("/posts/my")
+def get_my_posts(current_user: dict = Depends(get_current_user)):
+    user_posts = [p for p in posts if p["author"] == current_user["username"]]
+    return user_posts
+
+@app.get("/posts/all")
+def get_all_posts(current_admin: dict = Depends(get_current_admin)):
+    """Solo admin puede ver todos los posts"""
+    return posts
 
 # ------------------------------
 # SERVIDOR
